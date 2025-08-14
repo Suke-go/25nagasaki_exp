@@ -22,7 +22,7 @@ class PicoWorker(QThread):
     # エラーメッセージ（str）
     error = Signal(str)
 
-    def __init__(self, serial_port='COM3', baud_rate=9600):
+    def __init__(self, serial_port='COM4', baud_rate=9600):
         super().__init__()
         self.serial_port = serial_port
         self.baud_rate = baud_rate
@@ -86,3 +86,4 @@ class PicoWorker(QThread):
 
     def stop(self):
         self._is_running = False
+        self.wait()  # スレッドの終了を待機

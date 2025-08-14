@@ -28,8 +28,8 @@ class CameraWorker(QThread):
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         cap.set(cv2.CAP_PROP_FPS, 20)  # 表情解析に必要な滑らかさを保持
         
-        # ビデオのコーデックとフォーマットを定義
-        fourcc = cv2.VideoWriter_fourcc(*'H264')  # より効率的なコーデック
+        # ビデオのコーデックとフォーマットを定義（Windows互換性向上）
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 互換性の高いコーデック
         fps = 20  # 表情解析に適したフレームレート
         width = 1280  # HD解像度で表情の詳細をキャプチャ
         height = 720
@@ -54,3 +54,4 @@ class CameraWorker(QThread):
 
     def stop(self):
         self._is_running = False
+        self.wait()  # スレッドの終了を待機

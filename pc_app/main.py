@@ -3,10 +3,11 @@ import os
 import cv2
 import time
 import json
+import subprocess
 from datetime import datetime
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QStackedWidget, QPushButton, QGroupBox, QCheckBox, QMessageBox)
-from PySide6.QtCore import Qt, QPointF, QThread, Signal
-from PySide6.QtGui import QBrush, QPen, QColor, QPainter
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QStackedWidget, QPushButton, QGroupBox, QCheckBox, QMessageBox, QComboBox)
+from PySide6.QtCore import Qt, QPointF, QThread, Signal, QTimer
+from PySide6.QtGui import QBrush, QPen, QColor, QPainter, QPixmap, QImage
 import pyqtgraph as pg
 
 # --- ワーカーのインポート ---
@@ -129,8 +130,13 @@ class MainWindow(QMainWindow):
         self.active_camera_workers = []
         self.is_recording = False
         self.session_dir = ""
+        self.current_recording_dir = ""
+        self.recording_session_count = 0
         self.events_file = None
         self.gsr_file = None
+        self.preview_camera = None
+        self.preview_timer = QTimer()
+        self.preview_timer.timeout.connect(self.update_preview)
 
         # --- UI要素 ---
         self.stacked_widget = QStackedWidget()
@@ -162,12 +168,25 @@ class MainWindow(QMainWindow):
         # 左側: 動画とA/V表示
         left_widget = QWidget()
         left_layout = QVBoxLayout()
-        video_area = QLabel("動画表示エリア")
-        video_area.setStyleSheet("background-color: black; color: white; font-size: 16px;")
-        video_area.setAlignment(Qt.AlignCenter)
-        video_area.setMinimumHeight(400)
+        
+        # カメラ選択とプレビュー
+        camera_preview_layout = QHBoxLayout()
+        camera_preview_layout.addWidget(QLabel("プレビューカメラ:"))
+        self.preview_camera_combo = QComboBox()
+        self.preview_camera_combo.currentTextChanged.connect(self.change_preview_camera)
+        camera_preview_layout.addWidget(self.preview_camera_combo)
+        camera_preview_layout.addStretch()
+        
+        self.video_label = QLabel("動画表示エリア")
+        self.video_label.setStyleSheet("background-color: black; color: white; font-size: 16px;")
+        self.video_label.setAlignment(Qt.AlignCenter)
+        self.video_label.setMinimumHeight(400)
+        self.video_label.setScaledContents(True)
+        
         self.av_plot = AVPlot()
-        left_layout.addWidget(video_area, 2)
+        
+        left_layout.addLayout(camera_preview_layout)
+        left_layout.addWidget(self.video_label, 2)
         left_layout.addWidget(self.av_plot, 1)
         left_widget.setLayout(left_layout)
         
@@ -188,7 +207,7 @@ class MainWindow(QMainWindow):
         self.stacked_widget.addWidget(self.experiment_screen)
 
         # --- ワーカーのセットアップ ---
-        self.pico_worker = PicoWorker(serial_port='COM3') # ご自身のポートに合わせて変更してください
+        self.pico_worker = PicoWorker(serial_port='COM13') # find_com_ports.pyで確認したポート番号
         self.pico_worker.new_gsr_data.connect(self.handle_new_gsr)
         self.pico_worker.av_changed.connect(self.handle_av_change)
         self.pico_worker.record_toggled.connect(self.handle_record_toggle)
@@ -200,6 +219,38 @@ class MainWindow(QMainWindow):
         # 初期状態設定
         self.control_panel.update_status("カメラ選択待ち")
 
+    def get_camera_info(self, index):
+        """カメラの詳細情報を取得"""
+        try:
+            # PowerShellコマンドでカメラデバイスの情報を取得
+            cmd = f'Get-WmiObject -Class Win32_PnPEntity | Where-Object {{$_.Name -like "*camera*" -or $_.Name -like "*webcam*" -or $_.Name -like "*USB Video*"}} | Format-Table -Property Name, DeviceID -AutoSize'
+            result = subprocess.run(['powershell', '-Command', cmd], 
+                                  capture_output=True, text=True, timeout=5)
+            
+            camera_info = f"カメラ {index}"
+            if result.returncode == 0 and result.stdout:
+                lines = result.stdout.strip().split('\n')
+                # デバイス情報をパース（簡易版）
+                for line in lines:
+                    if 'USB' in line and 'camera' in line.lower():
+                        parts = line.split()
+                        if len(parts) > 0:
+                            camera_info = f"カメラ {index} - {parts[0]}"
+                            break
+            
+            # 解像度情報を取得
+            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                camera_info += f" ({width}x{height})"
+                cap.release()
+            
+            return camera_info
+        except Exception as e:
+            print(f"カメラ情報取得エラー {index}: {e}")
+            return f"カメラ {index}"
+
     def detect_cameras(self):
         # 既存のチェックボックスをクリア
         for checkbox in self.camera_checkboxes:
@@ -207,30 +258,78 @@ class MainWindow(QMainWindow):
             checkbox.deleteLater()
         self.camera_checkboxes = []
 
-        # 利用可能なカメラを検索
+        # 利用可能なカメラを検索（より安全に）
         available_cameras = []
-        for i in range(5): # 0から4まで試す
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                available_cameras.append(i)
+        camera_info_dict = {}
+        
+        for i in range(10): # 0から9まで試す（USBハブ使用のため範囲拡大）
+            try:
+                cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)  # DirectShowを使用してエラー軽減
+                if cap.isOpened():
+                    # 実際にフレームが取得できるかテスト
+                    ret, frame = cap.read()
+                    if ret:
+                        available_cameras.append(i)
+                        camera_info_dict[i] = self.get_camera_info(i)
+                        print(f"検出: {camera_info_dict[i]}")
+                    else:
+                        print(f"カメラ {i}: 開けるがフレーム取得不可")
                 cap.release()
+            except Exception as e:
+                print(f"カメラ {i}: エラー - {e}")
+        
+        print(f"検出されたカメラ: {available_cameras}")
         
         if not available_cameras:
-            self.show_error("利用可能なカメラが見つかりませんでした。")
+            self.show_error("利用可能なカメラが見つかりませんでした。\nUSBハブの接続やカメラの電源を確認してください。")
             return
 
         # チェックボックスを作成
         for index in available_cameras:
-            checkbox = QCheckBox(f"カメラ {index}")
+            camera_info = camera_info_dict.get(index, f"カメラ {index}")
+            checkbox = QCheckBox(camera_info)
+            checkbox.setToolTip(f"デバイス ID: {index}")  # ツールチップでデバイスIDを表示
             self.camera_layout.addWidget(checkbox)
             self.camera_checkboxes.append(checkbox)
 
     def start_experiment(self):
-        self.selected_cameras = [cb.text().split(' ')[1] for cb in self.camera_checkboxes if cb.isChecked()]
+        # チェックボックスからカメラインデックスを抽出
+        self.selected_cameras = []
+        for cb in self.camera_checkboxes:
+            if cb.isChecked():
+                # ツールチップからデバイスIDを取得
+                tooltip = cb.toolTip()
+                if tooltip and "デバイス ID:" in tooltip:
+                    camera_index = tooltip.split("デバイス ID: ")[1]
+                    self.selected_cameras.append(camera_index)
+                else:
+                    # フォールバック: テキストからカメラ番号を抽出
+                    text = cb.text()
+                    if "カメラ" in text:
+                        try:
+                            parts = text.split()
+                            camera_index = parts[1] if len(parts) > 1 else text.split("カメラ")[1].split()[0]
+                            self.selected_cameras.append(camera_index)
+                        except:
+                            pass
+        
         if not self.selected_cameras:
             self.show_error("録画するカメラを1台以上選択してください。")
             return
+        
+        # セッションディレクトリを作成
+        self.session_dir = f"data/{datetime.now().strftime('%Y%m%d-%H%M%S')}_PID001"
+        os.makedirs(self.session_dir, exist_ok=True)
+        self.recording_session_count = 0
+        
+        # プレビュー用カメラ選択肢を更新
+        self.preview_camera_combo.clear()
+        self.preview_camera_combo.addItem("プレビューなし")
+        for cam_index in self.selected_cameras:
+            self.preview_camera_combo.addItem(f"カメラ {cam_index}")
+        
         print(f"実験開始。選択されたカメラ: {self.selected_cameras}")
+        print(f"セッションディレクトリ: {self.session_dir}")
         self.control_panel.update_status("実験中 - 録画待機")
         self.stacked_widget.setCurrentIndex(1)
 
@@ -252,28 +351,32 @@ class MainWindow(QMainWindow):
         if self.is_recording:
             print("録画開始...")
             self.control_panel.update_status("録画中")
-            # 保存ディレクトリ作成
-            self.session_dir = f"data/{datetime.now().strftime('%Y%m%d-%H%M%S')}_PID001" # PIDは後で入力できるようにする
-            os.makedirs(os.path.join(self.session_dir, 'video'), exist_ok=True)
+            
+            # 録画セッション番号を増加し、サブディレクトリを作成
+            self.recording_session_count += 1
+            self.current_recording_dir = os.path.join(self.session_dir, f"session_{self.recording_session_count:02d}")
+            os.makedirs(os.path.join(self.current_recording_dir, 'video'), exist_ok=True)
+            
+            print(f"録画セッション {self.recording_session_count}: {self.current_recording_dir}")
             
             # ログファイルを開く
-            self.events_file = open(os.path.join(self.session_dir, 'events.jsonl'), 'a')
-            self.gsr_file = open(os.path.join(self.session_dir, 'serial.csv'), 'a')
+            self.events_file = open(os.path.join(self.current_recording_dir, 'events.jsonl'), 'a')
+            self.gsr_file = open(os.path.join(self.current_recording_dir, 'serial.csv'), 'a')
             self.gsr_file.write("pc_ns,gsr_value\n")
 
-            self.log_event('record_start', {})
+            self.log_event('record_start', {'session_number': self.recording_session_count})
 
             # 選択されたカメラの録画を開始
             for cam_index in self.selected_cameras:
-                save_path = os.path.join(self.session_dir, f"video/camera_{cam_index}.mp4")
+                save_path = os.path.join(self.current_recording_dir, f"video/camera_{cam_index}.mp4")
                 worker = CameraWorker(int(cam_index), save_path)
                 worker.error.connect(self.show_error)
                 self.active_camera_workers.append(worker)
                 worker.start()
         else:
-            print("録画停止...")
-            self.control_panel.update_status("待機中")
-            self.log_event('record_stop', {})
+            print(f"録画停止...セッション {self.recording_session_count} 完了")
+            self.control_panel.update_status("実験中 - 録画待機")
+            self.log_event('record_stop', {'session_number': self.recording_session_count})
             # カメラワーカーを停止
             for worker in self.active_camera_workers:
                 worker.stop()
@@ -301,6 +404,54 @@ class MainWindow(QMainWindow):
         }
         self.events_file.write(json.dumps(event_data) + '\n')
 
+    def change_preview_camera(self, camera_text):
+        # 既存のプレビューカメラを停止
+        if self.preview_camera:
+            self.preview_camera.release()
+            self.preview_camera = None
+        self.preview_timer.stop()
+        
+        if camera_text == "プレビューなし":
+            self.video_label.setText("動画表示エリア")
+            self.video_label.setStyleSheet("background-color: black; color: white; font-size: 16px;")
+            return
+        
+        # 新しいカメラを開始
+        try:
+            camera_index = int(camera_text.split(' ')[1])
+            self.preview_camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+            if self.preview_camera.isOpened():
+                self.preview_timer.start(33)  # 約30FPS
+                self.video_label.setStyleSheet("")
+            else:
+                self.show_error(f"カメラ {camera_index} を開けませんでした。")
+        except Exception as e:
+            self.show_error(f"プレビュー開始エラー: {str(e)}")
+    
+    def update_preview(self):
+        if not self.preview_camera or not self.preview_camera.isOpened():
+            return
+        
+        ret, frame = self.preview_camera.read()
+        if ret:
+            # フレームをリサイズ（表示用に適切なサイズに調整）
+            height, width, channel = frame.shape
+            target_width = 640
+            target_height = int(height * target_width / width)
+            frame = cv2.resize(frame, (target_width, target_height))
+            
+            # BGR → RGB変換
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_frame.shape
+            bytes_per_line = ch * w
+            
+            # QImageに変換
+            qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qt_image)
+            
+            # QLabelに設定
+            self.video_label.setPixmap(pixmap)
+
     def show_error(self, message):
         QMessageBox.critical(self, "エラー", message)
 
@@ -309,6 +460,12 @@ class MainWindow(QMainWindow):
         self.pico_worker.stop()
         for worker in self.active_camera_workers:
             worker.stop()
+        
+        # プレビューカメラも停止
+        if self.preview_camera:
+            self.preview_camera.release()
+        self.preview_timer.stop()
+        
         super().closeEvent(event)
 
 if __name__ == "__main__":

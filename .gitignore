@@ -1,18 +1,21 @@
-# Python
+# 実験データディレクトリ（録画ファイルは除外）
+data/
+experiment_data/
+
+# デバッグファイル
+*.debug
+debug.md
+
+# Python関連
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
 
-# venv
-.venv/
-venv/
-env/
-
-# IDE/Editor
+# IDEファイル
 .vscode/
-.idea/
+.claude/settings.local.json
 
-# Data
-pc_app/data/
-
-# Logs
+# 一時ファイル
+*.tmp
 *.log
